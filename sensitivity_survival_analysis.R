@@ -1,89 +1,68 @@
+# =============================================================================
+# Mortality-adjusted expected cost (unadjusted group means)
+# Expected cost in period t = mean survivor cost x S(t)
+#                           + mean cost in the period of death x P(death in t)
+# Cumulative difference between groups with a Monte Carlo CI.
+#
+# Inputs:
+#   persons      one row per person: id, group, time (years to death or
+#                censoring), event (1 = died)
+#   alive_panel  person-periods before death: id, group, period, cost
+#   death_costs  one row per decedent: id, group, death_cost (cost in the
+#                period of death)
+# Period length is `len` years (0.25 = quarterly).
+# =============================================================================
 library(dplyr)
 library(tidyr)
 library(survival)
 
-# Inputs: quarterly_panel_censored, quarterly_panel_partitioned, patient_covariates
+set.seed(123)
+periods <- 0:15
+len     <- 0.25
+R       <- 2000
 
-# KM survival by PASC status
-km_fit <- survfit(Surv(followup_time, event) ~ status, data = patient_covariates)
+# Kaplan-Meier survival at period boundaries
+km  <- summary(survfit(Surv(time, event) ~ group, data = persons),
+               times = (0:(max(periods) + 1)) * len)
+S_t <- tibble(group = sub("^group=", "", km$strata), period = round(km$time / len),
+              S = km$surv, S_lo = km$lower, S_hi = km$upper)
 
-S_by_group <- summary(km_fit, times = (0:20) * 0.25) %>%
-  {tibble(time = .$time, S = .$surv, S_lo = .$lower, S_hi = .$upper,
-          status = sub("^status=", "", .$strata))} %>%
-  mutate(quarter_since_index = round(time / 0.25)) %>%
-  select(status, quarter_since_index, S, S_lo, S_hi) %>%
-  complete(status, quarter_since_index = 0:19,
-           fill = list(S = 0, S_lo = 0, S_hi = 0))
+p_death <- S_t %>% group_by(group) %>% arrange(period) %>%
+  mutate(p    = S - lead(S),
+         p_lo = pmax(0, S_lo - lead(S_hi)),
+         p_hi = pmax(0, S_hi - lead(S_lo))) %>%
+  ungroup() %>% filter(period %in% periods)
 
-# Per-quarter death probability: S(t) - S(t+1)
-death_prob <- S_by_group %>%
-  bind_rows(
-    S_by_group %>% group_by(status) %>%
-      summarise(quarter_since_index = 20, S = 0, S_lo = 0, S_hi = 0, .groups = "drop")
-  ) %>%
-  arrange(status, quarter_since_index) %>%
-  group_by(status) %>%
-  mutate(
-    death_prob_q     = S - lead(S, default = 0),
-    death_prob_q_lo  = pmax(0, S_lo - lead(S_hi, default = 0)),
-    death_prob_q_hi  = pmax(0, S_hi - lead(S_lo, default = 0))
-  ) %>%
-  ungroup() %>%
-  filter(quarter_since_index <= 19) %>%
-  select(status, quarter_since_index, death_prob_q, death_prob_q_lo, death_prob_q_hi)
+# Survivor component
+alive <- alive_panel %>% group_by(group, period) %>%
+  summarise(m = mean(cost), se = sd(cost) / sqrt(n()), .groups = "drop") %>%
+  left_join(S_t, by = c("group", "period")) %>%
+  mutate(alive = m * S, alive_lo = pmax(0, m - 1.96 * se) * S_lo,
+         alive_hi = (m + 1.96 * se) * S_hi)
 
-# Component 1: Mean survivor costs × S(t)
-alive_component <- quarterly_panel_censored %>%
-  group_by(status, quarter_since_index) %>%
-  summarise(
-    mean_cost      = mean(quarterly_cost, na.rm = TRUE),
-    se_cost        = sd(quarterly_cost, na.rm = TRUE) / sqrt(n()),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    mean_cost_lo = pmax(0, mean_cost - 1.96 * se_cost),
-    mean_cost_hi = mean_cost + 1.96 * se_cost
-  ) %>%
-  left_join(S_by_group, by = c("status", "quarter_since_index")) %>%
-  mutate(
-    alive_comp     = mean_cost    * S,
-    alive_comp_lo  = pmax(0, mean_cost_lo * S_lo),
-    alive_comp_hi  = mean_cost_hi * S_hi
-  ) %>%
-  select(status, quarter_since_index, alive_comp, alive_comp_lo, alive_comp_hi)
+# Death-period component
+dc <- death_costs %>% group_by(group) %>%
+  summarise(e = mean(death_cost), se = sd(death_cost) / sqrt(n()), .groups = "drop")
+death <- p_death %>% left_join(dc, by = "group") %>%
+  mutate(dth = p * e, dth_lo = p_lo * pmax(0, e - 1.96 * se), dth_hi = p_hi * (e + 1.96 * se))
 
-# Component 2: Mean EOL costs × Pr(death in quarter t)
-# EOL = total costs in final 2 quarters before death
-eol_mean <- quarterly_panel_partitioned %>%
-  filter(cost_category == "end_of_life", died) %>%
-  group_by(patient_num) %>%
-  summarise(eol_cost = sum(quarterly_cost, na.rm = TRUE), .groups = "drop") %>%
-  left_join(patient_covariates %>% select(patient_num, status), by = "patient_num") %>%
-  group_by(status) %>%
-  summarise(
-    mean_eol     = mean(eol_cost),
-    se_eol       = sd(eol_cost) / sqrt(n()),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    mean_eol_lo  = pmax(0, mean_eol - 1.96 * se_eol),
-    mean_eol_hi  = mean_eol + 1.96 * se_eol
-  )
+expected <- alive %>%
+  left_join(dplyr::select(death, group, period, dth, dth_lo, dth_hi), by = c("group", "period")) %>%
+  mutate(expected = alive + dth)
 
-eol_component <- death_prob %>%
-  left_join(eol_mean, by = "status") %>%
-  mutate(
-    eol_comp     = death_prob_q    * mean_eol,
-    eol_comp_lo  = pmax(0, death_prob_q_lo * mean_eol_lo),
-    eol_comp_hi  = death_prob_q_hi * mean_eol_hi
-  ) %>%
-  select(status, quarter_since_index, eol_comp, eol_comp_lo, eol_comp_hi)
+# Cumulative difference (first group level minus second) with Monte Carlo CI.
+# Components are treated as independent across periods, so the CI is approximate.
+groups <- sort(unique(expected$group))
+draw <- function(g) {
+  d <- filter(expected, group == g)
+  replicate(R, sum(pmax(0, rnorm(nrow(d), d$alive, (d$alive_hi - d$alive_lo) / 3.92)) +
+                     pmax(0, rnorm(nrow(d), d$dth,   (d$dth_hi   - d$dth_lo)   / 3.92))))
+}
+totals <- expected %>% group_by(group) %>% summarise(total = sum(expected))
+mc <- draw(groups[1]) - draw(groups[2])
+est <- totals$total[totals$group == groups[1]] - totals$total[totals$group == groups[2]]
+c(estimate = est, quantile(mc, c(.025, .975)))
 
-# Population expected cost = alive component + EOL component
-pop_cost <- alive_component %>%
-  left_join(eol_component, by = c("status", "quarter_since_index")) %>%
-  mutate(
-    exp_cost     = alive_comp    + eol_comp,
-    exp_cost_lo  = alive_comp_lo + eol_comp_lo,
-    exp_cost_hi  = alive_comp_hi + eol_comp_hi
-  )
+
+
+
